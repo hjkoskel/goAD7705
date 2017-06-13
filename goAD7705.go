@@ -9,29 +9,54 @@ package goAD7705
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/davecheney/gpio"
-
 	"golang.org/x/exp/io/spi"
 )
 
+type ChSetup struct {
+	//For setup register
+	Gain     Gainsel `json:"gain"`
+	Unipolar bool    `json:"unipolar"`
+	Buffered bool    `json:"buffered"`
+	Filtsync bool    `json:"filtsync"`
+	//For clock register Clk and clkdiv are set on setup... only filter is adjusted
+	Odr ODR `json:"odr"`
+}
+
+//Parses setup from associative array
+
+func (p *ChSetup) ParseSetup(settings map[string]float64) {
+	if f, ok := settings["gain"]; ok {
+		p.Gain = Gainsel(f)
+	}
+	if f, ok := settings["bipolar"]; ok {
+		p.Unipolar = (f < 1)
+	}
+	if f, ok := settings["unipolar"]; ok {
+		p.Unipolar = (0 < f)
+	}
+
+	if f, ok := settings["buffered"]; ok {
+		p.Buffered = (0 < f)
+	}
+
+	if f, ok := settings["filtsync"]; ok {
+		p.Filtsync = (0 < f)
+	}
+
+	if f, ok := settings["odr"]; ok {
+		p.Odr = ODR(f)
+	}
+
+}
+
 type AD7705 struct {
-	spiConn *spi.Device
-	//selectRegValue byte //Without
-
-	//clock register status
-	masterClockDisable bool
-	clockDiv           bool
-	odr                [4]ODR //4 possible channel settings
-
+	spiConn  *spi.Device
+	clockDiv bool //at startup only
+	xtal     bool //CLK bit at startup
 	readyPin gpio.Pin
-
-	//setup register
-	mode     [4]Opmode
-	gain     [4]Gainsel
-	unipolar [4]bool
-	buffered [4]bool
-	filtsync [4]bool
 }
 
 const (
@@ -44,6 +69,36 @@ const (
 	REG_OFFSET        = 6
 	REG_GAIN          = 7
 )
+
+type RegSel byte
+
+func regCodeSetup(mode Opmode, gain Gainsel, unipolar bool, buffered bool, fsync bool) byte {
+	result := (byte(mode) << 6) | (byte(gain) << 3)
+	if unipolar {
+		result |= (1 << 2)
+	}
+	if buffered {
+		result |= (1 << 1)
+	}
+	if fsync {
+		result |= 1
+	}
+	return result
+}
+
+func regCodeClock(clkDis bool, clkDiv bool, clk bool, odr ODR) byte {
+	result := byte(odr)
+	if clkDis {
+		result |= (1 << 4)
+	}
+	if clkDiv {
+		result |= (1 << 3)
+	}
+	if clk {
+		result |= (1 << 2)
+	}
+	return result
+}
 
 const (
 	CH_AIN1        = 0
@@ -76,24 +131,66 @@ const (
 
 type Gainsel byte
 
-/*
-Pass negative number and AD wont wait readypin
-*/
-func InitAD7705(spidevice string, readypin int) (AD7705, error) {
+func GainInNumber(g Gainsel) float64 {
+	return []float64{1, 2, 4, 8, 16, 32, 64, 128}[g]
+}
 
-	result := AD7705{
-		masterClockDisable: false,
-		clockDiv:           true,
-		odr:                [4]ODR{ODR_50, ODR_50, ODR_50, ODR_50},
-		mode:               [4]Opmode{OPMODE_SELFCAL, OPMODE_SELFCAL, OPMODE_SELFCAL, OPMODE_SELFCAL},
-		gain:               [4]Gainsel{GAINSEL_1, GAINSEL_1, GAINSEL_1, GAINSEL_1},
-		unipolar:           [4]bool{false, false, false, false},
-		buffered:           [4]bool{false, false, false, false},
-		filtsync:           [4]bool{false, false, false, false},
+func PickGain(gain float64) Gainsel {
+	if 128 <= gain {
+		return GAINSEL_128
 	}
+	if 64 <= gain {
+		return GAINSEL_64
+	}
+	if 32 <= gain {
+		return GAINSEL_32
+	}
+	if 16 <= gain {
+		return GAINSEL_16
+	}
+	if 8 <= gain {
+		return GAINSEL_8
+	}
+	if 4 <= gain {
+		return GAINSEL_4
+	}
+	if 2 <= gain {
+		return GAINSEL_2
+	}
+	return GAINSEL_1
+}
+
+const (
+	ODRXTAL_20  = 0
+	ODRXTAL_25  = 1
+	ODRXTAL_100 = 2
+	ODRXTAL_200 = 3
+	ODROSC_50   = 0
+	ODROSC_60   = 1
+	ODROSC_250  = 2
+	ODROSC_500  = 3
+)
+
+type ODR byte
+
+func (p *AD7705) Set(ch Chsel, setup ChSetup) error {
+	_, err := p.WriteRegister(ch, REG_CLOCK, regCodeClock(false, p.clockDiv, p.xtal, setup.Odr))
+	if err != nil {
+		return err
+	}
+	_, err = p.WriteRegister(ch, REG_SETUP, regCodeSetup(OPMODE_NORMAL, setup.Gain, setup.Unipolar, setup.Buffered, setup.Filtsync))
+	return err
+}
+
+//Clockdiv and xtal settings depend on pcb.. not adjustable during run
+func InitAD7705(spidevice string, readypin int, xtal bool, clkdiv bool, setup ChSetup) (AD7705, error) {
+	fmt.Printf("Initializing AD7705\n")
+	result := AD7705{}
+
+	result.clockDiv = clkdiv
+	result.xtal = xtal
 
 	if 0 < readypin {
-
 		pin, err := gpio.OpenPin(readypin, gpio.ModeInput)
 		result.readyPin = pin
 		if err != nil {
@@ -101,21 +198,7 @@ func InitAD7705(spidevice string, readypin int) (AD7705, error) {
 			return result, err
 		}
 	}
-
-	/*
-		d := &spi.Devfs{
-			Dev:      spidevice, // "/dev/spidev0.0",
-			Mode:     spi.Mode3,
-			MaxSpeed: 50000,
-		}
-
-		dev, err := d.Open()
-		if err != nil {
-			fmt.Printf("Cannot read device %#v\n", err)
-			return result, err
-		}
-	*/
-
+	fmt.Printf("Going to open\n")
 	dev, err := spi.Open(&spi.Devfs{
 		Dev:      spidevice, // "/dev/spidev0.0",
 		Mode:     spi.Mode3,
@@ -124,204 +207,193 @@ func InitAD7705(spidevice string, readypin int) (AD7705, error) {
 	if err != nil {
 		return result, err
 	}
-	dev.SetBitsPerWord(8) //IMPORTANT
-	dev.SetCSChange(true)
+	if err = dev.SetDelay(200 * time.Millisecond); err != nil {
+		return result, err
+	}
+	if err = dev.SetBitsPerWord(8); err != nil {
+		return result, err
+	}
+	if err = dev.SetCSChange(true); err != nil {
+		return result, err
+	}
 
 	result.spiConn = dev
-	//result.spiConn.SetDelay(100 * time.Millisecond)
 
-	//result.busReset()
+	fmt.Printf("Going to reset\n")
+	if err = result.BusReset(); err != nil {
+		return result, err
+	}
+	fmt.Printf("Reset done Going to set channels\n")
 
-	//setup register
-	result.updateRegClock(CH_AIN1)
-	result.updateRegSetup(CH_AIN1)
-	result.WaitDataReady(CH_AIN1)
-	//time.Sleep(time.Second * 2)
-
-	result.updateRegClock(CH_AIN2)
-	result.updateRegSetup(CH_AIN2)
-	result.WaitDataReady(CH_AIN2)
-
+	if err = result.Set(CH_AIN1, setup); err != nil {
+		return result, err
+	}
+	if err = result.Set(CH_AIN2, setup); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
-func (p *AD7705) SetMasterClockDisable(chSelection Chsel, masterClockDisable bool) error {
-	p.masterClockDisable = masterClockDisable
-	return p.updateRegClock(chSelection)
+func (p *AD7705) BusReset() error {
+	tx := []byte{0xFF}
+	rx := []byte{0}
+	for i := 0; i < 100; i++ {
+		tx[0] = 0xFF
+		if err := p.spiConn.Tx(tx, rx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-/*
-masterClockDisable bool
-clockDiv bool
-odr ODR
-*/
-
-func (p *AD7705) SetClockdiv(chSelection Chsel, clkdiv bool) error {
-	p.clockDiv = clkdiv
-	return p.updateRegClock(chSelection)
+func (p *AD7705) WriteRegister(chSelection Chsel, register RegSel, data byte) (byte, error) {
+	tx := []byte{byte(register<<4) | byte(chSelection)}
+	rx := make([]byte, len(tx))
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	tx[0] = data
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	return rx[0], nil
 }
 
-const (
-	ODR_20  = 0
-	ODR_25  = 1
-	ODR_100 = 2
-	ODR_200 = 3
-	ODR_50  = 4
-	ODR_60  = 5
-	ODR_250 = 6
-	ODR_500 = 7
-)
-
-type ODR byte
-
-func (p *AD7705) SetOutputDataRate(chSelection Chsel, rate ODR) error {
-	p.odr[chSelection] = rate
-	return p.updateRegClock(chSelection)
+func (p *AD7705) WriteRegister24(chSelection Chsel, register RegSel, data uint32) (uint32, error) {
+	tx := []byte{byte(register<<4) | byte(chSelection)}
+	rx := make([]byte, len(tx))
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	tx = []byte{byte(data >> 16), byte((data >> 8)) & byte(0xFF), byte(data & 0xFF)}
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	return (uint32(rx[2]) << 16) | (uint32(rx[1]) << 8) | (uint32(rx[0])), nil
 }
 
-/*
-	mode [4]Opmode
-	gain [4]Chsel
-	unipolar bool
-	buffered bool
-*/
-
-func (p *AD7705) SetOpMode(chSelection Chsel, mode Opmode) error {
-	p.mode[chSelection] = mode
-	return p.updateRegSetup(chSelection)
+func (p *AD7705) readRegister(chSelection Chsel, register RegSel) (byte, error) {
+	tx := []byte{byte(register<<4) | (1 << 3) | byte(chSelection)}
+	rx := make([]byte, len(tx))
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return rx[0], err
+	}
+	tx[0] = 0
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return rx[0], err
+	}
+	return rx[0], nil
 }
 
-func (p *AD7705) SetGain(chSelection Chsel, gain Gainsel) error {
-	p.gain[chSelection] = gain
-	return p.updateRegSetup(chSelection)
-}
-
-func (p *AD7705) SetUnipolar(chSelection Chsel) error {
-	p.unipolar[chSelection] = true
-	return p.updateRegSetup(chSelection)
-}
-
-func (p *AD7705) SetBipolar(chSelection Chsel) error {
-	p.unipolar[chSelection] = true
-	return p.updateRegSetup(chSelection)
-}
-
-func (p *AD7705) SetBuffered(chSelection Chsel, buffered bool) error {
-	p.buffered[chSelection] = buffered
-	return p.updateRegSetup(chSelection)
-}
-
-func (p *AD7705) SetFiltSync(chSelection Chsel, filtsync bool) error {
-	p.filtsync[chSelection] = filtsync
-	return p.updateRegSetup(chSelection)
+func (p *AD7705) readRegister24(chSelection Chsel, register RegSel) (uint32, error) {
+	tx := []byte{byte(register<<4) | (1 << 3) | byte(chSelection)}
+	rx := make([]byte, len(tx))
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	tx[0] = 0
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	result := uint32(rx[0]) << 16
+	tx[0] = 0
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	result |= uint32(rx[0]) << 8
+	tx[0] = 0
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
+	}
+	result |= uint32(rx[0])
+	return result, nil
 }
 
 func (p *AD7705) ReadData(chSelection Chsel) (uint16, error) {
-	tx := []byte{byte(REG_DATA<<4) | byte(chSelection) | (1 << 3), 0, 0}
-	rx := make([]byte, len(tx))
-	err := p.spiConn.Tx(tx, rx)
-	//fmt.Printf("read data tx=%#v rx=%#v\n", tx, rx)
-	if err != nil {
+	tx0 := []byte{byte(REG_DATA<<4) | (1 << 3) | byte(chSelection)}
+	rx0 := make([]byte, len(tx0))
+	if err := p.spiConn.Tx(tx0, rx0); err != nil {
 		return 0, err
 	}
-	return uint16(rx[1]) + uint16(rx[2])<<8, nil
-}
 
-//Uses registers if ready line is not available
-func (p *AD7705) DataReady(chSelection Chsel) (bool, error) {
-	if p.readyPin != nil {
-		pinvalue := p.readyPin.Get()
-		//fmt.Printf("Ready pin is %v\n", pinvalue)
-		return !pinvalue, nil //Down is ready?
+	tx := []byte{0}
+	rx := []byte{0}
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
 	}
+	hi := rx[0]
 
-	tx := []byte{byte(REG_COMMUNICATION<<4) | byte(chSelection) | (1 << 3), 0}
-	rx := make([]byte, len(tx))
-	err := p.spiConn.Tx(tx, rx)
-	if err != nil {
-		return false, err
+	tx = []byte{0}
+	rx = []byte{0}
+	if err := p.spiConn.Tx(tx, rx); err != nil {
+		return 0, err
 	}
-	//fmt.Printf("Ready returns %#v\n", rx)
-	return rx[1]&0x80 == 0, err
+	lo := rx[0]
+
+	fmt.Printf("DATA hi=%X lo=%X\n", hi, lo)
+	return (uint16(hi) << 8) | uint16(lo), nil
 }
 
 func (p *AD7705) WaitDataReady(chSelection Chsel) error {
+	if p.readyPin != nil {
+		for p.readyPin.Get() {
+		}
+		return nil
+	}
 	for {
-		ready, err := p.DataReady(chSelection)
+		regValue, err := p.readRegister(chSelection, REG_COMMUNICATION)
+		//fmt.Printf("Wait result=%v\n", regValue)
 		if err != nil {
 			return err
 		}
-		if ready {
+		if regValue&0x80 == 0 {
 			return nil
 		}
 	}
 }
 
-func (p *AD7705) ReadVoltage(chSelection Chsel) (float64, error) {
-	r, err := p.ReadData(chSelection)
-	if err != nil {
-		return 0, err
+func PickRightGainFor(voltage float64) Gainsel {
+	vMaxInternal := 2.5
+	if voltage/vMaxInternal < (1.0 / 128.0) {
+		return GAINSEL_128
 	}
-	gain := float64(byte(1 << byte(p.gain[chSelection])))
-	//fmt.Printf("ch %v gain is %v hex=%X value=%v\n", chSelection, gain, r, r)
-	volts := float64(r) * 5 / (float64(0xFFFF) * gain)
-
-	//For ADC test not calibrated
-	/*	volts -= 0.820325016
-		volts /= 0.8632
-	*/
-	return volts, nil
+	if voltage/vMaxInternal < (1.0 / 64.0) {
+		return GAINSEL_64
+	}
+	if voltage/vMaxInternal < (1.0 / 32.0) {
+		return GAINSEL_32
+	}
+	if voltage/vMaxInternal < (1.0 / 16.0) {
+		return GAINSEL_16
+	}
+	if voltage/vMaxInternal < (1.0 / 8.0) {
+		return GAINSEL_8
+	}
+	if voltage/vMaxInternal < (1.0 / 4.0) {
+		return GAINSEL_4
+	}
+	if voltage/vMaxInternal < (1.0 / 2.0) {
+		return GAINSEL_2
+	}
+	return GAINSEL_1
 }
 
-//Internal use, copies struct status to actual hardware
-func (p *AD7705) updateRegClock(chSelection Chsel) error {
-	clockbyte := byte(p.odr[chSelection])
-	if p.clockDiv {
-		clockbyte |= (1 << 3)
-	}
-	if p.masterClockDisable {
-		clockbyte |= (1 << 4)
-	}
-	tx := []byte{byte(REG_CLOCK<<4) | byte(chSelection), clockbyte}
-	rx := make([]byte, len(tx))
-	err := p.spiConn.Tx(tx, rx)
-	fmt.Printf("Update reg clock tx=%#X rx=%#v\n", tx, rx)
-	return err
-}
+/*
+Calibrations.
 
-//Internal use, copies struct status to actual hardware
-func (p *AD7705) updateRegSetup(chSelection Chsel) error {
-	setupbyte := (byte(p.mode[chSelection]) << 6) | (byte(p.gain[chSelection]) << 3)
-	if p.unipolar[chSelection] {
-		setupbyte |= (1 << 2)
-	}
-	if p.buffered[chSelection] {
-		setupbyte |= (1 << 1)
-	}
-	if p.filtsync[chSelection] {
-		setupbyte |= 1
-	}
-	tx := []byte{byte(REG_SETUP<<4) | byte(chSelection), setupbyte}
-	rx := make([]byte, len(tx))
-	err := p.spiConn.Tx(tx, rx)
-	//fmt.Printf("Update reg setup tx=%#X rx=%#v\n", tx, rx)
+Possible calibration operations
+1)Self-calibration:
+	internal zero and full scale
 
-	return err
-}
+2)Zero scale system calibration
+3)Full scale system calibration
 
-func (p *AD7705) busReset() error {
-	tx := make([]byte, 10)
+*/
 
-	for i := 0; i < 10; i++ {
-		tx[i] = 0xFF
-
+func (p *AD7705) SelfCal(chSelection Chsel, setup ChSetup, mode Opmode) error {
+	if _, err := p.WriteRegister(chSelection, REG_SETUP, regCodeSetup(mode, setup.Gain, setup.Unipolar, setup.Buffered, setup.Filtsync)); err != nil {
+		return err
 	}
-	for i := 0; i < 10; i++ {
-		rx := make([]byte, len(tx))
-		err := p.spiConn.Tx(tx, rx)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	time.Sleep(1000 * time.Millisecond) //Testing
+	return p.WaitDataReady(chSelection)
 }
